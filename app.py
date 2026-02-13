@@ -1,884 +1,926 @@
 from __future__ import annotations
 
 import os
-import json
 import time
-from dataclasses import dataclass, asdict
-from datetime import date, timedelta
-from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple
+import hashlib
+from dataclasses import dataclass
+from datetime import datetime, date, timedelta
+from typing import Dict, List, Tuple, Optional
 
-from flask import Flask, request, redirect, url_for, render_template_string, session
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+from flask import Flask, request, redirect, url_for, render_template_string, session, abort
 
 # ============================================================
-# CONFIG (Render-friendly)
+# SETTINGS (set these in Render -> Environment)
 # ============================================================
 
 APP_NAME = "Chores Tracker"
-DATA_FILE = os.environ.get("DATA_FILE", "chores_game.json")
 
-# ✅ Family code keeps strangers out (set this on Render > Environment)
-FAMILY_CODE = os.environ.get("FAMILY_CODE", "1234")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")  # Neon/Supabase/Render Postgres URL
+SECRET_KEY = os.environ.get("SECRET_KEY", "change-me")
+FAMILY_CODE = os.environ.get("FAMILY_CODE", "")    # one shared code for your family
+PARENT_PIN = os.environ.get("PARENT_PIN", "")      # parent-only pages
 
-# ✅ Parent PIN protects parent-only actions (set this on Render > Environment)
-PARENT_PIN = os.environ.get("PARENT_PIN", "0000")
-
-# ✅ Secret key needed for sessions (set this on Render > Environment)
-SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-change-me")
+if not DATABASE_URL:
+    # Don't crash immediately—show a helpful page instead.
+    DATABASE_OK = False
+else:
+    DATABASE_OK = True
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
 
 
 # ============================================================
-# MODELS
+# DATABASE HELPERS
 # ============================================================
 
-@dataclass
-class Kid:
-    name: str
-    goal_cents: int = 0
+def db():
+    # Note: psycopg2 connects using DATABASE_URL
+    return psycopg2.connect(DATABASE_URL)
 
+def sha16(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
 
-@dataclass
-class Chore:
-    id: str
-    title: str
-    reward_cents: int
-    requires_approval: bool = True
+def init_db():
+    if not DATABASE_OK:
+        return
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS families (
+                id SERIAL PRIMARY KEY,
+                code_hash TEXT UNIQUE NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            );
+            """)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS kids (
+                id SERIAL PRIMARY KEY,
+                family_id INTEGER NOT NULL REFERENCES families(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                goal_cents INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(family_id, name)
+            );
+            """)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS chores (
+                id SERIAL PRIMARY KEY,
+                family_id INTEGER NOT NULL REFERENCES families(id) ON DELETE CASCADE,
+                chore_key TEXT NOT NULL,
+                title TEXT NOT NULL,
+                reward_cents INTEGER NOT NULL,
+                requires_approval BOOLEAN NOT NULL DEFAULT TRUE,
+                UNIQUE(family_id, chore_key)
+            );
+            """)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS ledger (
+                id SERIAL PRIMARY KEY,
+                family_id INTEGER NOT NULL REFERENCES families(id) ON DELETE CASCADE,
+                kid_name TEXT NOT NULL,
+                chore_key TEXT NOT NULL,
+                chore_title TEXT NOT NULL,
+                reward_cents INTEGER NOT NULL,
+                ts DOUBLE PRECISION NOT NULL,
+                status TEXT NOT NULL
+            );
+            """)
 
+def get_or_create_family_id() -> int:
+    code_hash = sha16(FAMILY_CODE)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM families WHERE code_hash=%s", (code_hash,))
+            row = cur.fetchone()
+            if row:
+                return int(row[0])
+            cur.execute("INSERT INTO families(code_hash) VALUES(%s) RETURNING id", (code_hash,))
+            return int(cur.fetchone()[0])
 
-@dataclass
-class LedgerEntry:
-    kid_name: str
-    chore_id: str
-    chore_title: str
-    reward_cents: int
-    ts: float
-    status: str  # pending | approved | denied | paid
-
-
-# ============================================================
-# HELPERS
-# ============================================================
+def seed_default_chores(family_id: int):
+    defaults = [
+        ("make_bed", "Make bed", 50, False),
+        ("dishes", "Unload dishwasher", 100, True),
+        ("trash", "Take out trash", 75, False),
+        ("homework", "Homework (checked)", 100, True),
+    ]
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM chores WHERE family_id=%s", (family_id,))
+            count = int(cur.fetchone()[0])
+            if count > 0:
+                return
+            for key, title, cents, req in defaults:
+                cur.execute(
+                    "INSERT INTO chores(family_id, chore_key, title, reward_cents, requires_approval) VALUES(%s,%s,%s,%s,%s)",
+                    (family_id, key, title, cents, req),
+                )
 
 def dollars(cents: int) -> str:
     return f"${cents/100:.2f}"
 
 
-def safe_id(s: str) -> str:
-    s = s.strip().lower()
-    out = []
-    for ch in s:
-        if ch.isalnum():
-            out.append(ch)
-        else:
-            out.append("_")
-    cid = "".join(out)
-    while "__" in cid:
-        cid = cid.replace("__", "_")
-    return cid.strip("_") or "chore"
-
-
-def ts_to_date(ts: float) -> date:
-    return date.fromtimestamp(ts)
-
-
-def calc_streak(kid: str, ledger: List[LedgerEntry]) -> int:
-    done_days = set()
-    for e in ledger:
-        if e.kid_name == kid and e.status != "denied":
-            done_days.add(ts_to_date(e.ts))
-    streak = 0
-    d = date.today()
-    while d in done_days:
-        streak += 1
-        d = d - timedelta(days=1)
-    return streak
-
-
 # ============================================================
-# STORAGE
+# AUTH (Family code + Parent pin)
 # ============================================================
 
-class Store:
-    def __init__(self, path: str = DATA_FILE):
-        self.path = Path(path)
+@app.before_request
+def require_family_login():
+    # Allow access to login page and static
+    if request.endpoint in ("family_login", "static", "db_help"):
+        return
 
-    def load(self) -> Dict[str, Any]:
-        if not self.path.exists():
-            return {"kids": {}, "chores": {}, "ledger": []}
-        return json.loads(self.path.read_text(encoding="utf-8"))
+    # If DB is not set, show a setup page for any route
+    if not DATABASE_OK:
+        return redirect(url_for("db_help"))
 
-    def save(self, data: Dict[str, Any]) -> None:
-        self.path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-
-
-# ============================================================
-# GAME LOGIC
-# ============================================================
-
-class Game:
-    def __init__(self, store: Store):
-        self.store = store
-        self.data = self.store.load()
-
-        self.kids: Dict[str, Kid] = {
-            name: Kid(**kid_dict) for name, kid_dict in self.data.get("kids", {}).items()
-        }
-
-        self.chores: Dict[str, Chore] = {
-            cid: Chore(**c) for cid, c in self.data.get("chores", {}).items()
-        }
-
-        self.ledger: List[LedgerEntry] = [
-            LedgerEntry(**e) for e in self.data.get("ledger", [])
-        ]
-
-        if not self.chores:
-            self.seed_defaults()
-            self.persist()
-
-    def persist(self) -> None:
-        self.data["kids"] = {k: asdict(v) for k, v in self.kids.items()}
-        self.data["chores"] = {cid: asdict(v) for cid, v in self.chores.items()}
-        self.data["ledger"] = [asdict(e) for e in self.ledger]
-        self.store.save(self.data)
-
-    def seed_defaults(self) -> None:
-        defaults = [
-            Chore("make_bed", "Make bed", 50, requires_approval=False),
-            Chore("dishes", "Unload dishwasher", 100, requires_approval=True),
-            Chore("trash", "Take out trash", 75, requires_approval=False),
-            Chore("homework", "Homework (checked)", 100, requires_approval=True),
-        ]
-        for c in defaults:
-            self.chores[c.id] = c
-
-    # Kids
-    def add_kid(self, name: str) -> bool:
-        name = name.strip()
-        if not name:
-            return False
-        if name in self.kids:
-            return False
-        self.kids[name] = Kid(name=name, goal_cents=0)
-        self.persist()
-        return True
-
-    def set_goal(self, kid_name: str, goal_cents: int) -> None:
-        if kid_name not in self.kids:
-            return
-        if goal_cents < 0:
-            goal_cents = 0
-        self.kids[kid_name].goal_cents = goal_cents
-        self.persist()
-
-    # Chores
-    def add_or_update_chore(self, title: str, reward_cents: int, requires_approval: bool) -> None:
-        title = title.strip()
-        if not title:
-            return
-        cid = safe_id(title)
-        self.chores[cid] = Chore(cid, title, max(0, reward_cents), requires_approval)
-        self.persist()
-
-    def delete_chore(self, cid: str) -> None:
-        if cid in self.chores:
-            del self.chores[cid]
-            self.persist()
-
-    # Ledger
-    def submit_chore(self, kid_name: str, chore_id: str) -> None:
-        if kid_name not in self.kids:
-            return
-        if chore_id not in self.chores:
-            return
-        c = self.chores[chore_id]
-        status = "pending" if c.requires_approval else "approved"
-        self.ledger.append(
-            LedgerEntry(
-                kid_name=kid_name,
-                chore_id=c.id,
-                chore_title=c.title,
-                reward_cents=c.reward_cents,
-                ts=time.time(),
-                status=status,
-            )
-        )
-        self.persist()
-
-    def pending(self) -> List[Tuple[int, LedgerEntry]]:
-        return [(i, e) for i, e in enumerate(self.ledger) if e.status == "pending"]
-
-    def approve_or_deny(self, idx: int, approve: bool) -> None:
-        if idx < 0 or idx >= len(self.ledger):
-            return
-        e = self.ledger[idx]
-        if e.status != "pending":
-            return
-        e.status = "approved" if approve else "denied"
-        self.persist()
-
-    def mark_paid_for_kid(self, kid_name: str) -> int:
-        total = 0
-        for e in self.ledger:
-            if e.kid_name == kid_name and e.status == "approved":
-                e.status = "paid"
-                total += e.reward_cents
-        self.persist()
-        return total
-
-    # Summaries
-    def owed_by_kid(self) -> Dict[str, int]:
-        owed = {k: 0 for k in self.kids.keys()}
-        for e in self.ledger:
-            if e.status == "approved":
-                owed[e.kid_name] = owed.get(e.kid_name, 0) + e.reward_cents
-        return owed
-
-    def lifetime_earned_by_kid(self) -> Dict[str, int]:
-        earned = {k: 0 for k in self.kids.keys()}
-        for e in self.ledger:
-            if e.status in ("approved", "paid"):
-                earned[e.kid_name] = earned.get(e.kid_name, 0) + e.reward_cents
-        return earned
-
-    def total_chores_by_kid(self) -> Dict[str, int]:
-        counts = {k: 0 for k in self.kids.keys()}
-        for e in self.ledger:
-            if e.status != "denied":
-                counts[e.kid_name] = counts.get(e.kid_name, 0) + 1
-        return counts
-
-    def chores_list_for_kid(self, kid_name: str, limit: int = 50) -> List[LedgerEntry]:
-        items = [e for e in self.ledger if e.kid_name == kid_name]
-        items.sort(key=lambda x: x.ts, reverse=True)
-        return items[:limit]
-
-
-game = Game(Store(DATA_FILE))
-
-
-# ============================================================
-# AUTH (Family + Parent)
-# ============================================================
-
-def require_family():
-    if session.get("family_ok"):
-        return None
-    return redirect(url_for("family_login"))
-
-
-def require_parent():
+    # Require family login
     if not session.get("family_ok"):
         return redirect(url_for("family_login"))
-    if session.get("parent_ok"):
-        return None
-    return redirect(url_for("parent_login"))
 
+def require_parent():
+    if not session.get("parent_ok"):
+        return redirect(url_for("parent_login"))
 
-# ============================================================
-# HTML RENDERING (fixes the {{ }} bug)
-# ============================================================
+@app.get("/db-help")
+def db_help():
+    # Shown if DATABASE_URL is missing
+    page = """
+    <h1>Database not set</h1>
+    <p>This app needs a DATABASE_URL (Postgres) to remember chores on the free plan.</p>
+    <p>In Render: Service → Environment → add <b>DATABASE_URL</b>, then redeploy.</p>
+    """
+    return render_template_string(BASE, title="Setup", body=page)
 
-BASE = """
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>{{ title }}</title>
-  <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 18px; max-width: 980px; }
-    nav a { margin-right: 10px; }
-    .card { border: 1px solid #e7e7e7; border-radius: 14px; padding: 14px; margin: 12px 0; }
-    .row { display:flex; gap: 10px; flex-wrap: wrap; align-items: center; }
-    .btn { padding: 10px 12px; border-radius: 12px; border: 1px solid #ccc; background:#fafafa; cursor:pointer; }
-    .btn-primary { background:#111; color:#fff; border-color:#111; }
-    .btn-danger { background:#fff5f5; border-color:#ffcccc; }
-    input, select { padding: 10px; border-radius: 12px; border: 1px solid #ccc; }
-    table { width:100%; border-collapse: collapse; }
-    th, td { padding: 8px; border-bottom: 1px solid #eee; text-align:left; vertical-align: top; }
-    small { color:#666; }
-    .pill { display:inline-block; padding: 2px 8px; border-radius: 999px; border:1px solid #ddd; font-size: 12px; }
-  </style>
-</head>
-<body>
-  <nav>
-    <a href="{{ url_for('home') }}">Home</a>
-    <a href="{{ url_for('kid_menu') }}">Kid</a>
-    <a href="{{ url_for('kid_summary') }}">Kid Summary</a>
-    <a href="{{ url_for('parent_dash') }}">Parent</a>
-    <a href="{{ url_for('edit_chores') }}">Edit Chores</a>
-    <a href="{{ url_for('logout') }}">Logout</a>
-  </nav>
-  <hr/>
-  {{ body|safe }}
-</body>
-</html>
-"""
-
-
-def render_page(title: str, body_template: str, **ctx) -> str:
-    body_html = render_template_string(body_template, **ctx)
-    return render_template_string(BASE, title=title, body=body_html)
-
-
-# ============================================================
-# ROUTES: Login / Logout
-# ============================================================
-
-@app.route("/family", methods=["GET", "POST"])
-@app.route("/family/", methods=["GET", "POST"])
+@app.get("/login")
 def family_login():
-    if request.method == "POST":
-        code = request.form.get("family_code", "").strip()
-        if code == FAMILY_CODE:
-            session["family_ok"] = True
-            session.pop("parent_ok", None)
-            return redirect(url_for("home"))
-        return render_page("Family Login", """
-            <h1>Family Login</h1>
-            <p style="color:red;">Wrong family code.</p>
-            <form method="post" action="/family">
-              <input name="family_code" placeholder="Family Code" required>
-              <button class="btn btn-primary" type="submit">Enter</button>
-            </form>
-            <p><small>Tip: if you did not set a code on Render, the default is 1234.</small></p>
-        """)
-    return render_page("Family Login", """
-        <h1>Family Login</h1>
-        <form method="post" action="/family">
-          <input name="family_code" placeholder="Family Code" required>
+    # Note: no hints
+    page = """
+    <h1>Family Login</h1>
+    <div class="card">
+      <form method="post" action="{{ url_for('family_login_post') }}">
+        <div class="row">
+          <input name="code" placeholder="Family Code" required />
           <button class="btn btn-primary" type="submit">Enter</button>
-        </form>
-        <p><small>Tip: if you did not set a code on Render, the default is 1234.</small></p>
-    """)
+        </div>
+      </form>
+    </div>
+    """
+    return render_template_string(BASE, title="Login", body=page)
 
+@app.post("/login")
+def family_login_post():
+    entered = (request.form.get("code") or "").strip()
 
-@app.route("/parent_login", methods=["GET", "POST"])
-@app.route("/parent_login/", methods=["GET", "POST"])
-def parent_login():
-    gate = require_family()
-    if gate:
-        return gate
+    # No hints:
+    if not entered or entered != FAMILY_CODE:
+        # just reload login silently
+        session.clear()
+        return redirect(url_for("family_login"))
 
-    if request.method == "POST":
-        pin = request.form.get("parent_pin", "").strip()
-        if pin == PARENT_PIN:
-            session["parent_ok"] = True
-            return redirect(url_for("parent_dash"))
-        return render_page("Parent Login", """
-            <h1>Parent Login</h1>
-            <p style="color:red;">Wrong parent PIN.</p>
-            <form method="post" action="/parent_login">
-              <input name="parent_pin" placeholder="Parent PIN" required>
-              <button class="btn btn-primary" type="submit">Enter</button>
-            </form>
-        """)
-    return render_page("Parent Login", """
-        <h1>Parent Login</h1>
-        <form method="post" action="/parent_login">
-          <input name="parent_pin" placeholder="Parent PIN" required>
-          <button class="btn btn-primary" type="submit">Enter</button>
-        </form>
-    """)
-
+    session.clear()
+    session["family_ok"] = True
+    # parent_ok stays False until parent logs in
+    return redirect(url_for("home"))
 
 @app.get("/logout")
 def logout():
     session.clear()
     return redirect(url_for("family_login"))
 
+@app.get("/parent/login")
+def parent_login():
+    page = """
+    <h1>Parent Login</h1>
+    <div class="card">
+      <form method="post" action="{{ url_for('parent_login_post') }}">
+        <div class="row">
+          <input name="pin" placeholder="Parent PIN" required />
+          <button class="btn btn-primary" type="submit">Enter</button>
+        </div>
+      </form>
+    </div>
+    """
+    return render_template_string(BASE, title="Parent Login", body=page)
+
+@app.post("/parent/login")
+def parent_login_post():
+    pin = (request.form.get("pin") or "").strip()
+    if not pin or pin != PARENT_PIN:
+        session["parent_ok"] = False
+        return redirect(url_for("parent_login"))
+    session["parent_ok"] = True
+    return redirect(url_for("parent_dashboard"))
+
 
 # ============================================================
-# ROUTES: Home (Main Menu)
+# COMPUTATIONS (owed, streaks, totals)
+# ============================================================
+
+def today_local() -> date:
+    return datetime.now().date()
+
+def ledger_rows(family_id: int, kid_name: Optional[str] = None) -> List[dict]:
+    with db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if kid_name:
+                cur.execute(
+                    "SELECT * FROM ledger WHERE family_id=%s AND kid_name=%s ORDER BY id DESC",
+                    (family_id, kid_name),
+                )
+            else:
+                cur.execute("SELECT * FROM ledger WHERE family_id=%s ORDER BY id DESC", (family_id,))
+            return list(cur.fetchall())
+
+def chores_rows(family_id: int) -> List[dict]:
+    with db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM chores WHERE family_id=%s ORDER BY title ASC", (family_id,))
+            return list(cur.fetchall())
+
+def kids_rows(family_id: int) -> List[dict]:
+    with db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM kids WHERE family_id=%s ORDER BY name ASC", (family_id,))
+            return list(cur.fetchall())
+
+def owed_by_kid(family_id: int) -> Dict[str, int]:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT kid_name, COALESCE(SUM(reward_cents),0)
+                FROM ledger
+                WHERE family_id=%s AND status='approved'
+                GROUP BY kid_name
+            """, (family_id,))
+            out = {}
+            for kid, total in cur.fetchall():
+                out[str(kid)] = int(total)
+            return out
+
+def totals_by_kid(family_id: int) -> Dict[str, int]:
+    # total chores logged (pending + approved + paid)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT kid_name, COUNT(*)
+                FROM ledger
+                WHERE family_id=%s AND status IN ('pending','approved','paid')
+                GROUP BY kid_name
+            """, (family_id,))
+            return {str(k): int(c) for k, c in cur.fetchall()}
+
+def paid_total_by_kid(family_id: int) -> Dict[str, int]:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT kid_name, COALESCE(SUM(reward_cents),0)
+                FROM ledger
+                WHERE family_id=%s AND status='paid'
+                GROUP BY kid_name
+            """, (family_id,))
+            return {str(k): int(s) for k, s in cur.fetchall()}
+
+def streak_for_kid(family_id: int, kid_name: str) -> int:
+    # streak = consecutive days (ending today) where kid logged at least one chore
+    rows = ledger_rows(family_id, kid_name)
+    days = set()
+    for r in rows:
+        ts = float(r["ts"])
+        d = datetime.fromtimestamp(ts).date()
+        if r["status"] in ("pending", "approved", "paid"):
+            days.add(d)
+
+    streak = 0
+    d = today_local()
+    while d in days:
+        streak += 1
+        d = d - timedelta(days=1)
+    return streak
+
+
+# ============================================================
+# CORE ACTIONS
+# ============================================================
+
+def ensure_family_ready() -> int:
+    init_db()
+    family_id = get_or_create_family_id()
+    seed_default_chores(family_id)
+    return family_id
+
+def add_kid_db(family_id: int, name: str):
+    name = name.strip()
+    if not name:
+        return
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO kids(family_id,name) VALUES(%s,%s) ON CONFLICT (family_id,name) DO NOTHING",
+                (family_id, name),
+            )
+
+def set_goal_db(family_id: int, kid_name: str, goal_cents: int):
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE kids SET goal_cents=%s WHERE family_id=%s AND name=%s",
+                (goal_cents, family_id, kid_name),
+            )
+
+def add_or_update_chore_db(family_id: int, key: str, title: str, cents: int, requires_approval: bool):
+    key = key.strip()
+    title = title.strip()
+    if not key or not title:
+        return
+    if cents < 0:
+        return
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO chores(family_id, chore_key, title, reward_cents, requires_approval)
+                VALUES(%s,%s,%s,%s,%s)
+                ON CONFLICT (family_id, chore_key)
+                DO UPDATE SET title=EXCLUDED.title, reward_cents=EXCLUDED.reward_cents, requires_approval=EXCLUDED.requires_approval
+            """, (family_id, key, title, cents, requires_approval))
+
+def delete_chore_db(family_id: int, key: str):
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM chores WHERE family_id=%s AND chore_key=%s", (family_id, key))
+
+def submit_chore_db(family_id: int, kid_name: str, chore_key: str):
+    with db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM chores WHERE family_id=%s AND chore_key=%s",
+                (family_id, chore_key),
+            )
+            chore = cur.fetchone()
+            if not chore:
+                return
+            status = "pending" if bool(chore["requires_approval"]) else "approved"
+            cur.execute("""
+                INSERT INTO ledger(family_id, kid_name, chore_key, chore_title, reward_cents, ts, status)
+                VALUES(%s,%s,%s,%s,%s,%s,%s)
+            """, (
+                family_id,
+                kid_name,
+                chore_key,
+                chore["title"],
+                int(chore["reward_cents"]),
+                time.time(),
+                status
+            ))
+
+def approve_deny_db(family_id: int, ledger_id: int, approve: bool):
+    new_status = "approved" if approve else "denied"
+    with db() as conn:
+        with conn.cursor() as cur:
+            # only pending can change
+            cur.execute("""
+                UPDATE ledger
+                SET status=%s
+                WHERE family_id=%s AND id=%s AND status='pending'
+            """, (new_status, family_id, ledger_id))
+
+def mark_paid_db(family_id: int, kid_name: str):
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE ledger
+                SET status='paid'
+                WHERE family_id=%s AND kid_name=%s AND status='approved'
+            """, (family_id, kid_name))
+
+
+# ============================================================
+# UI TEMPLATES
+# ============================================================
+
+BASE = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{ title }}</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 18px; max-width: 980px; }
+    a { color: #111; }
+    .top a { margin-right: 12px; }
+    .card { border: 1px solid #e6e6e6; border-radius: 14px; padding: 14px; margin: 14px 0; }
+    .row { display:flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    .btn { display:inline-block; padding: 10px 12px; border-radius: 12px; border: 1px solid #ccc; background: #fafafa; text-decoration: none; color: #111; cursor:pointer; }
+    .btn-primary { background:#111; color:#fff; border-color:#111; }
+    .btn-danger { background:#fff5f5; border-color:#ffcccc; }
+    table { width:100%; border-collapse: collapse; }
+    th, td { padding: 8px; border-bottom: 1px solid #eee; text-align:left; vertical-align: top; }
+    input, select { padding: 9px; border-radius: 12px; border: 1px solid #ccc; }
+    small { color:#666; }
+  </style>
+</head>
+<body>
+  <div class="top">
+    <a href="{{ url_for('home') }}">Home</a>
+    <a href="{{ url_for('kid_menu') }}">Kid</a>
+    <a href="{{ url_for('parent_dashboard') }}">Parent</a>
+    <a href="{{ url_for('logout') }}">Logout</a>
+  </div>
+  <hr />
+  {{ body|safe }}
+</body>
+</html>
+"""
+
+
+# ============================================================
+# ROUTES
 # ============================================================
 
 @app.get("/")
 def home():
-    gate = require_family()
-    if gate:
-        return gate
+    family_id = ensure_family_ready()
+    page = """
+    <h1>{{ app_name }}</h1>
 
-    return render_page("Home", """
-      <h1>{{ app_name }}</h1>
-      <div class="card">
-        <h2>Main Menu</h2>
-        <div class="row">
-          <a class="btn btn-primary" href="{{ url_for('kid_menu') }}">Kid Menu</a>
-          <a class="btn btn-primary" href="{{ url_for('kid_summary') }}">Kid Summary</a>
-          <a class="btn btn-primary" href="{{ url_for('parent_dash') }}">Parent Dashboard</a>
-        </div>
-        <p><small>Parents: you’ll be asked for the Parent PIN the first time you open the parent pages.</small></p>
+    <div class="card">
+      <h2>Main Menu</h2>
+      <div class="row">
+        <a class="btn btn-primary" href="{{ url_for('kid_menu') }}">Kid Menu</a>
+        <a class="btn btn-primary" href="{{ url_for('parent_dashboard') }}">Parent Dashboard</a>
       </div>
-    """, app_name=APP_NAME)
-
-
-# ============================================================
-# ROUTES: Kid Menu + Log Chore
-# ============================================================
+      <p><small>Tip: Parent pages need the Parent PIN.</small></p>
+    </div>
+    """
+    return render_template_string(BASE, title="Home", body=render_template_string(page, app_name=APP_NAME))
 
 @app.get("/kid")
 def kid_menu():
-    gate = require_family()
-    if gate:
-        return gate
+    family_id = ensure_family_ready()
+    kids = kids_rows(family_id)
+    chores = chores_rows(family_id)
 
-    kids_list = sorted(game.kids.keys())
-    chores_list = sorted(game.chores.values(), key=lambda c: c.title.lower())
+    page = """
+    <h1>Kid Menu</h1>
 
-    return render_page("Kid Menu", """
-      <h1>Kid Menu</h1>
+    <div class="card">
+      <h2>Log a chore</h2>
+      {% if kids|length == 0 %}
+        <p>No kids yet. Ask a parent to add you in Parent Dashboard.</p>
+      {% else %}
+        <form method="post" action="{{ url_for('kid_log') }}">
+          <div class="row">
+            <select name="kid_name" required>
+              {% for k in kids %}
+                <option value="{{ k['name'] }}">{{ k['name'] }}</option>
+              {% endfor %}
+            </select>
 
-      <div class="card">
-        <h2>Log a chore</h2>
+            <select name="chore_key" required>
+              {% for c in chores %}
+                <option value="{{ c['chore_key'] }}">
+                  {{ c['title'] }} ({{ dollars(c['reward_cents']) }})
+                  {% if c['requires_approval'] %} [needs approval]{% else %} [auto]{% endif %}
+                </option>
+              {% endfor %}
+            </select>
 
-        {% if not kids_list %}
-          <p>No kids exist yet. Ask a parent to add one in the Parent Dashboard.</p>
-        {% else %}
-          <form method="post" action="{{ url_for('kid_log') }}">
-            <div class="row">
-              <select name="kid_name" required>
-                {% for k in kids_list %}
-                  <option value="{{k}}">{{k}}</option>
-                {% endfor %}
-              </select>
+            <button class="btn btn-primary" type="submit">Log Chore</button>
+          </div>
+        </form>
+      {% endif %}
+    </div>
 
-              <select name="chore_id" required>
-                {% for c in chores_list %}
-                  <option value="{{c.id}}">
-                    {{ c.title }} ({{ dollars(c.reward_cents) }}) {% if c.requires_approval %}[needs approval]{% else %}[auto]{% endif %}
-                  </option>
-                {% endfor %}
-              </select>
-
-              <button class="btn btn-primary" type="submit">Log Chore</button>
-            </div>
-          </form>
-        {% endif %}
-      </div>
-
-      <div class="card">
-        <h2>Kid Summary</h2>
-        <p><small>Pick your name to see your chores, money, streak, and goal progress.</small></p>
-        {% if kids_list %}
-          <form method="get" action="{{ url_for('kid_summary') }}">
-            <div class="row">
-              <select name="kid_name" required>
-                {% for k in kids_list %}
-                  <option value="{{k}}">{{k}}</option>
-                {% endfor %}
-              </select>
-              <button class="btn" type="submit">View</button>
-            </div>
-          </form>
-        {% endif %}
-      </div>
-    """, kids_list=kids_list, chores_list=chores_list, dollars=dollars)
-
+    <div class="card">
+      <h2>Kid Summary</h2>
+      {% if kids|length == 0 %}
+        <p>No kids yet.</p>
+      {% else %}
+        <form method="get" action="{{ url_for('kid_summary') }}">
+          <div class="row">
+            <select name="kid_name" required>
+              {% for k in kids %}
+                <option value="{{ k['name'] }}">{{ k['name'] }}</option>
+              {% endfor %}
+            </select>
+            <button class="btn" type="submit">View</button>
+          </div>
+        </form>
+      {% endif %}
+    </div>
+    """
+    body = render_template_string(page, kids=kids, chores=chores, dollars=dollars)
+    return render_template_string(BASE, title="Kid", body=body)
 
 @app.post("/kid/log")
 def kid_log():
-    gate = require_family()
-    if gate:
-        return gate
-
-    kid_name = request.form.get("kid_name", "").strip()
-    chore_id = request.form.get("chore_id", "").strip()
-    game.submit_chore(kid_name, chore_id)
+    family_id = ensure_family_ready()
+    kid_name = (request.form.get("kid_name") or "").strip()
+    chore_key = (request.form.get("chore_key") or "").strip()
+    if kid_name and chore_key:
+        submit_chore_db(family_id, kid_name, chore_key)
     return redirect(url_for("kid_menu"))
-
-
-# ============================================================
-# ROUTES: Kid Summary (your own chores + money + streak + goal)
-# ============================================================
 
 @app.get("/kid/summary")
 def kid_summary():
-    gate = require_family()
-    if gate:
-        return gate
+    family_id = ensure_family_ready()
+    kid_name = (request.args.get("kid_name") or "").strip()
+    if not kid_name:
+        return redirect(url_for("kid_menu"))
 
-    kids_list = sorted(game.kids.keys())
-    kid_name = request.args.get("kid_name", "").strip()
+    kids = kids_rows(family_id)
+    kid = next((k for k in kids if k["name"] == kid_name), None)
+    if not kid:
+        return redirect(url_for("kid_menu"))
 
-    owed = game.owed_by_kid()
-    earned = game.lifetime_earned_by_kid()
-    totals = game.total_chores_by_kid()
+    owed = owed_by_kid(family_id).get(kid_name, 0)
+    paid_total = paid_total_by_kid(family_id).get(kid_name, 0)
+    total_done = totals_by_kid(family_id).get(kid_name, 0)
+    streak = streak_for_kid(family_id, kid_name)
 
-    chosen = kid_name if kid_name in game.kids else (kids_list[0] if kids_list else "")
+    rows = ledger_rows(family_id, kid_name)[:50]
 
-    entries = game.chores_list_for_kid(chosen, limit=30) if chosen else []
-    streak = calc_streak(chosen, game.ledger) if chosen else 0
-    goal_cents = game.kids[chosen].goal_cents if chosen else 0
+    goal = int(kid["goal_cents"])
+    progress = paid_total + owed  # what you've earned (paid + waiting)
+    remaining = max(goal - progress, 0)
 
-    return render_page("Kid Summary", """
-      <h1>Kid Summary</h1>
+    page = """
+    <h1>Kid Summary: {{ kid_name }}</h1>
 
-      {% if not kids_list %}
-        <p>No kids exist yet. Ask a parent to add one.</p>
+    <div class="card">
+      <div class="row">
+        <div><b>Owed (approved, unpaid):</b> {{ dollars(owed) }}</div>
+        <div><b>Paid total:</b> {{ dollars(paid_total) }}</div>
+        <div><b>Total chores:</b> {{ total_done }}</div>
+        <div><b>Streak:</b> {{ streak }} day(s)</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Goal</h2>
+      <p><b>Goal:</b> {{ dollars(goal) }}</p>
+      <p><b>Earned (paid + owed):</b> {{ dollars(progress) }}</p>
+      <p><b>Remaining:</b> {{ dollars(remaining) }}</p>
+    </div>
+
+    <div class="card">
+      <h2>Recent chores</h2>
+      {% if rows|length == 0 %}
+        <p>No chores yet.</p>
       {% else %}
-        <div class="card">
-          <form method="get" action="{{ url_for('kid_summary') }}">
-            <div class="row">
-              <select name="kid_name">
-                {% for k in kids_list %}
-                  <option value="{{k}}" {% if k==chosen %}selected{% endif %}>{{k}}</option>
-                {% endfor %}
-              </select>
-              <button class="btn" type="submit">Switch Kid</button>
-            </div>
-          </form>
-        </div>
-
-        <div class="card">
-          <h2>{{ chosen }}</h2>
-          <div class="row">
-            <div><span class="pill">Streak: {{ streak }} day(s)</span></div>
-            <div><span class="pill">Total chores: {{ totals.get(chosen,0) }}</span></div>
-            <div><span class="pill">Owed: {{ dollars(owed.get(chosen,0)) }}</span></div>
-            <div><span class="pill">Lifetime earned: {{ dollars(earned.get(chosen,0)) }}</span></div>
-          </div>
-
-          <h3>Goal</h3>
-          <p>
-            Goal: <b>{{ dollars(goal_cents) }}</b>
-            {% if goal_cents > 0 %}
-              — Progress (lifetime earned): <b>{{ dollars(earned.get(chosen,0)) }}</b>
-            {% endif %}
-          </p>
-          <form method="post" action="{{ url_for('set_goal') }}">
-            <input type="hidden" name="kid_name" value="{{ chosen }}">
-            <div class="row">
-              <input name="goal_cents" placeholder="Goal cents (example: 500 = $5)" required>
-              <button class="btn" type="submit">Set Goal</button>
-            </div>
-            <p><small>Parents can help set goals too. This is safe (doesn't change money).</small></p>
-          </form>
-        </div>
-
-        <div class="card">
-          <h3>Recent chores</h3>
-          {% if not entries %}
-            <p>No chores yet.</p>
-          {% else %}
-            <table>
-              <tr><th>Chore</th><th>Amount</th><th>Status</th></tr>
-              {% for e in entries %}
-                <tr>
-                  <td>{{ e.chore_title }}</td>
-                  <td>{{ dollars(e.reward_cents) }}</td>
-                  <td>{{ e.status }}</td>
-                </tr>
-              {% endfor %}
-            </table>
-          {% endif %}
-        </div>
+        <table>
+          <tr><th>When</th><th>Chore</th><th>Amount</th><th>Status</th></tr>
+          {% for r in rows %}
+            <tr>
+              <td>{{ dt(r['ts']) }}</td>
+              <td>{{ r['chore_title'] }}</td>
+              <td>{{ dollars(r['reward_cents']) }}</td>
+              <td>{{ r['status'] }}</td>
+            </tr>
+          {% endfor %}
+        </table>
       {% endif %}
-    """,
-    kids_list=kids_list,
-    chosen=chosen,
-    entries=entries,
-    streak=streak,
-    owed=owed,
-    earned=earned,
-    totals=totals,
-    goal_cents=goal_cents,
-    dollars=dollars
+    </div>
+
+    <div class="card">
+      <a class="btn" href="{{ url_for('kid_menu') }}">Back to Kid Menu</a>
+    </div>
+    """
+    def dt(ts: float) -> str:
+        return datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M")
+
+    body = render_template_string(
+        page,
+        kid_name=kid_name,
+        owed=owed,
+        paid_total=paid_total,
+        total_done=total_done,
+        streak=streak,
+        rows=rows,
+        dollars=dollars,
+        dt=dt,
+        goal=goal,
+        progress=progress,
+        remaining=remaining,
     )
-
-
-@app.post("/kid/goal")
-def set_goal():
-    gate = require_family()
-    if gate:
-        return gate
-    kid_name = request.form.get("kid_name", "").strip()
-    raw = request.form.get("goal_cents", "0").strip()
-    try:
-        goal = int(raw)
-    except ValueError:
-        goal = 0
-    game.set_goal(kid_name, goal)
-    return redirect(url_for("kid_summary", kid_name=kid_name))
-
-
-# ============================================================
-# ROUTES: Parent Dashboard (owed + exactly which chores + approvals)
-# ============================================================
+    return render_template_string(BASE, title="Kid Summary", body=body)
 
 @app.get("/parent")
-def parent_dash():
-    gate = require_parent()
-    if gate:
-        return gate
+def parent_dashboard():
+    require_parent()
+    family_id = ensure_family_ready()
 
-    kids_list = sorted(game.kids.keys())
-    owed = game.owed_by_kid()
-    totals = game.total_chores_by_kid()
-    pending = game.pending()
+    kids = kids_rows(family_id)
+    chores = chores_rows(family_id)
+    owed = owed_by_kid(family_id)
+    totals = totals_by_kid(family_id)
+    paid_totals = paid_total_by_kid(family_id)
 
-    # last 50 entries with index
-    recent = list(enumerate(game.ledger))[-50:]
-    recent.reverse()
+    # pending list
+    with db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT * FROM ledger
+                WHERE family_id=%s AND status='pending'
+                ORDER BY id DESC
+            """, (family_id,))
+            pending = list(cur.fetchall())
 
-    # per-kid list of recent chores (approved/pending/paid; not denied)
-    per_kid: Dict[str, List[LedgerEntry]] = {k: [] for k in kids_list}
-    for e in sorted(game.ledger, key=lambda x: x.ts, reverse=True):
-        if e.status == "denied":
-            continue
-        if e.kid_name in per_kid and len(per_kid[e.kid_name]) < 15:
-            per_kid[e.kid_name].append(e)
+    page = """
+    <h1>Parent Dashboard</h1>
 
-    return render_page("Parent Dashboard", """
-      <h1>Parent Dashboard</h1>
+    <div class="card">
+      <h2>Add a kid</h2>
+      <form method="post" action="{{ url_for('parent_add_kid') }}">
+        <div class="row">
+          <input name="kid_name" placeholder="Kid name" required />
+          <button class="btn btn-primary" type="submit">Add</button>
+        </div>
+      </form>
+    </div>
 
-      <div class="card">
-        <h2>Kids + Money Owed</h2>
-        {% if not kids_list %}
-          <p>No kids yet. Add one below.</p>
-        {% else %}
-          <table>
-            <tr><th>Kid</th><th>Total chores</th><th>Owed (approved, unpaid)</th><th>Pay</th></tr>
-            {% for k in kids_list %}
-              <tr>
-                <td>{{ k }}</td>
-                <td>{{ totals.get(k,0) }}</td>
-                <td><b>{{ dollars(owed.get(k,0)) }}</b></td>
-                <td>
-                  <form method="post" action="{{ url_for('pay_kid') }}">
-                    <input type="hidden" name="kid_name" value="{{k}}">
-                    <button class="btn" type="submit">Mark paid</button>
-                  </form>
-                </td>
-              </tr>
-            {% endfor %}
-          </table>
-          <p><small>“Owed” = sum of APPROVED chores not yet PAID.</small></p>
-        {% endif %}
-      </div>
-
-      <div class="card">
-        <h2>Pending approvals</h2>
-        {% if not pending %}
-          <p>No pending chores.</p>
-        {% else %}
-          <table>
-            <tr><th>Kid</th><th>Chore</th><th>Amount</th><th>Action</th></tr>
-            {% for idx, e in pending %}
-              <tr>
-                <td>{{ e.kid_name }}</td>
-                <td>{{ e.chore_title }}</td>
-                <td>{{ dollars(e.reward_cents) }}</td>
-                <td class="row">
-                  <form method="post" action="{{ url_for('approve') }}">
-                    <input type="hidden" name="idx" value="{{idx}}">
-                    <input type="hidden" name="approve" value="1">
-                    <button class="btn btn-primary" type="submit">Approve</button>
-                  </form>
-                  <form method="post" action="{{ url_for('approve') }}">
-                    <input type="hidden" name="idx" value="{{idx}}">
-                    <input type="hidden" name="approve" value="0">
-                    <button class="btn btn-danger" type="submit">Deny</button>
-                  </form>
-                </td>
-              </tr>
-            {% endfor %}
-          </table>
-        {% endif %}
-      </div>
-
-      <div class="card">
-        <h2>Exactly what each kid did (recent)</h2>
-        {% if not kids_list %}
-          <p>Add kids first.</p>
-        {% else %}
-          {% for k in kids_list %}
-            <h3>{{k}}</h3>
-            {% if not per_kid.get(k) %}
-              <p><small>No chores yet.</small></p>
-            {% else %}
-              <table>
-                <tr><th>Chore</th><th>Amount</th><th>Status</th></tr>
-                {% for e in per_kid.get(k) %}
-                  <tr>
-                    <td>{{ e.chore_title }}</td>
-                    <td>{{ dollars(e.reward_cents) }}</td>
-                    <td>{{ e.status }}</td>
-                  </tr>
-                {% endfor %}
-              </table>
-            {% endif %}
+    <div class="card">
+      <h2>Kids (owed + streaks + goals)</h2>
+      {% if kids|length == 0 %}
+        <p>No kids yet.</p>
+      {% else %}
+        <table>
+          <tr>
+            <th>Kid</th>
+            <th>Total chores</th>
+            <th>Streak</th>
+            <th>Owed</th>
+            <th>Paid total</th>
+            <th>Goal</th>
+            <th>Set goal</th>
+            <th>Pay</th>
+            <th>Details</th>
+          </tr>
+          {% for k in kids %}
+            {% set name = k['name'] %}
+            <tr>
+              <td><b>{{ name }}</b></td>
+              <td>{{ totals.get(name, 0) }}</td>
+              <td>{{ streak(name) }} day(s)</td>
+              <td><b>{{ dollars(owed.get(name, 0)) }}</b></td>
+              <td>{{ dollars(paid_totals.get(name, 0)) }}</td>
+              <td>{{ dollars(k['goal_cents']) }}</td>
+              <td>
+                <form method="post" action="{{ url_for('parent_set_goal') }}">
+                  <input type="hidden" name="kid_name" value="{{ name }}" />
+                  <input name="goal_cents" placeholder="cents" style="width:90px;" required />
+                  <button class="btn" type="submit">Set</button>
+                </form>
+              </td>
+              <td>
+                <form method="post" action="{{ url_for('parent_pay_kid') }}">
+                  <input type="hidden" name="kid_name" value="{{ name }}" />
+                  <button class="btn" type="submit">Mark paid</button>
+                </form>
+              </td>
+              <td>
+                <a class="btn" href="{{ url_for('parent_kid_details', kid_name=name) }}">See chores</a>
+              </td>
+            </tr>
           {% endfor %}
-        {% endif %}
-      </div>
+        </table>
+        <p><small>“Owed” = approved chores not marked paid yet.</small></p>
+      {% endif %}
+    </div>
 
-      <div class="card">
-        <h2>Add a kid</h2>
-        <form method="post" action="{{ url_for('add_kid') }}">
-          <div class="row">
-            <input name="kid_name" placeholder="Kid name" required>
-            <button class="btn btn-primary" type="submit">Add kid</button>
-          </div>
-        </form>
-      </div>
+    <div class="card">
+      <h2>Pending approvals</h2>
+      {% if pending|length == 0 %}
+        <p>No pending chores.</p>
+      {% else %}
+        <table>
+          <tr><th>Kid</th><th>Chore</th><th>Amount</th><th>Action</th></tr>
+          {% for r in pending %}
+            <tr>
+              <td>{{ r['kid_name'] }}</td>
+              <td>{{ r['chore_title'] }}</td>
+              <td>{{ dollars(r['reward_cents']) }}</td>
+              <td class="row">
+                <form method="post" action="{{ url_for('parent_approve') }}">
+                  <input type="hidden" name="ledger_id" value="{{ r['id'] }}" />
+                  <input type="hidden" name="approve" value="1" />
+                  <button class="btn btn-primary" type="submit">Approve</button>
+                </form>
+                <form method="post" action="{{ url_for('parent_approve') }}">
+                  <input type="hidden" name="ledger_id" value="{{ r['id'] }}" />
+                  <input type="hidden" name="approve" value="0" />
+                  <button class="btn btn-danger" type="submit">Deny</button>
+                </form>
+              </td>
+            </tr>
+          {% endfor %}
+        </table>
+      {% endif %}
+    </div>
 
-      <div class="card">
-        <h2>Recent activity (last 50)</h2>
-        {% if not recent %}
-          <p>No activity yet.</p>
-        {% else %}
-          <table>
-            <tr><th>Kid</th><th>Chore</th><th>Amount</th><th>Status</th></tr>
-            {% for idx, e in recent %}
-              <tr>
-                <td>{{ e.kid_name }}</td>
-                <td>{{ e.chore_title }}</td>
-                <td>{{ dollars(e.reward_cents) }}</td>
-                <td>{{ e.status }}</td>
-              </tr>
-            {% endfor %}
-          </table>
-        {% endif %}
-      </div>
-    """,
-    kids_list=kids_list,
-    owed=owed,
-    totals=totals,
-    pending=pending,
-    per_kid=per_kid,
-    recent=recent,
-    dollars=dollars
+    <div class="card">
+      <h2>Edit chores & payouts</h2>
+      <a class="btn btn-primary" href="{{ url_for('parent_edit_chores') }}">Edit chores</a>
+    </div>
+    """
+
+    def streak(name: str) -> int:
+        return streak_for_kid(family_id, name)
+
+    body = render_template_string(
+        page,
+        kids=kids,
+        chores=chores,
+        owed=owed,
+        totals=totals,
+        paid_totals=paid_totals,
+        pending=pending,
+        dollars=dollars,
+        streak=streak,
     )
-
+    return render_template_string(BASE, title="Parent", body=body)
 
 @app.post("/parent/add_kid")
-def add_kid():
-    gate = require_parent()
-    if gate:
-        return gate
-    kid_name = request.form.get("kid_name", "").strip()
-    game.add_kid(kid_name)
-    return redirect(url_for("parent_dash"))
+def parent_add_kid():
+    require_parent()
+    family_id = ensure_family_ready()
+    name = (request.form.get("kid_name") or "").strip()
+    add_kid_db(family_id, name)
+    return redirect(url_for("parent_dashboard"))
 
-
-@app.post("/parent/approve")
-def approve():
-    gate = require_parent()
-    if gate:
-        return gate
-    idx = int(request.form.get("idx", "-1"))
-    approve_val = request.form.get("approve", "0") == "1"
-    game.approve_or_deny(idx, approve_val)
-    return redirect(url_for("parent_dash"))
-
+@app.post("/parent/set_goal")
+def parent_set_goal():
+    require_parent()
+    family_id = ensure_family_ready()
+    kid_name = (request.form.get("kid_name") or "").strip()
+    raw = (request.form.get("goal_cents") or "").strip()
+    try:
+        goal_cents = int(raw)
+    except ValueError:
+        goal_cents = 0
+    if goal_cents < 0:
+        goal_cents = 0
+    set_goal_db(family_id, kid_name, goal_cents)
+    return redirect(url_for("parent_dashboard"))
 
 @app.post("/parent/pay")
-def pay_kid():
-    gate = require_parent()
-    if gate:
-        return gate
-    kid_name = request.form.get("kid_name", "").strip()
-    game.mark_paid_for_kid(kid_name)
-    return redirect(url_for("parent_dash"))
+def parent_pay_kid():
+    require_parent()
+    family_id = ensure_family_ready()
+    kid_name = (request.form.get("kid_name") or "").strip()
+    mark_paid_db(family_id, kid_name)
+    return redirect(url_for("parent_dashboard"))
 
-
-# ============================================================
-# ROUTES: Edit Chores & Payouts
-# ============================================================
-
-@app.get("/parent/edit_chores")
-def edit_chores():
-    gate = require_parent()
-    if gate:
-        return gate
-
-    chores_list = sorted(game.chores.values(), key=lambda c: c.title.lower())
-
-    return render_page("Edit Chores", """
-      <h1>Edit Chores & Payouts</h1>
-
-      <div class="card">
-        <h2>Add / Update chore</h2>
-        <form method="post" action="{{ url_for('save_chore') }}">
-          <div class="row">
-            <input name="title" placeholder="Chore title (example: Vacuum)" required>
-            <input name="reward_cents" placeholder="Reward cents (example: 75)" required>
-            <select name="requires_approval">
-              <option value="1">Needs approval</option>
-              <option value="0">Auto-approved</option>
-            </select>
-            <button class="btn btn-primary" type="submit">Save</button>
-          </div>
-          <p><small>Tip: 100 cents = $1.00</small></p>
-        </form>
-      </div>
-
-      <div class="card">
-        <h2>Current chores</h2>
-        {% if not chores_list %}
-          <p>No chores yet.</p>
-        {% else %}
-          <table>
-            <tr><th>ID</th><th>Title</th><th>Payout</th><th>Approval</th><th>Delete</th></tr>
-            {% for c in chores_list %}
-              <tr>
-                <td>{{ c.id }}</td>
-                <td>{{ c.title }}</td>
-                <td>{{ dollars(c.reward_cents) }}</td>
-                <td>{% if c.requires_approval %}needs approval{% else %}auto{% endif %}</td>
-                <td>
-                  <form method="post" action="{{ url_for('delete_chore') }}">
-                    <input type="hidden" name="chore_id" value="{{ c.id }}">
-                    <button class="btn btn-danger" type="submit">Delete</button>
-                  </form>
-                </td>
-              </tr>
-            {% endfor %}
-          </table>
-        {% endif %}
-      </div>
-
-      <div class="card">
-        <a class="btn" href="{{ url_for('parent_dash') }}">← Back to Parent</a>
-      </div>
-    """, chores_list=chores_list, dollars=dollars)
-
-
-@app.post("/parent/edit_chores/save")
-def save_chore():
-    gate = require_parent()
-    if gate:
-        return gate
-
-    title = request.form.get("title", "").strip()
-    raw = request.form.get("reward_cents", "0").strip()
-    requires = request.form.get("requires_approval", "1") == "1"
+@app.post("/parent/approve")
+def parent_approve():
+    require_parent()
+    family_id = ensure_family_ready()
+    ledger_id_raw = (request.form.get("ledger_id") or "").strip()
+    approve = (request.form.get("approve") or "0") == "1"
     try:
-        reward = int(raw)
+        ledger_id = int(ledger_id_raw)
     except ValueError:
-        reward = 0
+        return redirect(url_for("parent_dashboard"))
+    approve_deny_db(family_id, ledger_id, approve)
+    return redirect(url_for("parent_dashboard"))
 
-    game.add_or_update_chore(title, reward, requires)
-    return redirect(url_for("edit_chores"))
+@app.get("/parent/kid/<kid_name>")
+def parent_kid_details(kid_name: str):
+    require_parent()
+    family_id = ensure_family_ready()
+    kid_name = (kid_name or "").strip()
 
+    rows = ledger_rows(family_id, kid_name)[:200]
 
-@app.post("/parent/edit_chores/delete")
-def delete_chore():
-    gate = require_parent()
-    if gate:
-        return gate
+    page = """
+    <h1>Chores for {{ kid_name }}</h1>
 
-    cid = request.form.get("chore_id", "").strip()
-    game.delete_chore(cid)
-    return redirect(url_for("edit_chores"))
+    <div class="card">
+      {% if rows|length == 0 %}
+        <p>No chores yet.</p>
+      {% else %}
+        <table>
+          <tr><th>When</th><th>Chore</th><th>Amount</th><th>Status</th></tr>
+          {% for r in rows %}
+            <tr>
+              <td>{{ dt(r['ts']) }}</td>
+              <td>{{ r['chore_title'] }}</td>
+              <td>{{ dollars(r['reward_cents']) }}</td>
+              <td>{{ r['status'] }}</td>
+            </tr>
+          {% endfor %}
+        </table>
+      {% endif %}
+    </div>
+
+    <div class="card">
+      <a class="btn" href="{{ url_for('parent_dashboard') }}">Back to Parent</a>
+    </div>
+    """
+
+    def dt(ts: float) -> str:
+        return datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M")
+
+    body = render_template_string(page, kid_name=kid_name, rows=rows, dollars=dollars, dt=dt)
+    return render_template_string(BASE, title="Kid Details", body=body)
+
+@app.get("/parent/chores")
+def parent_edit_chores():
+    require_parent()
+    family_id = ensure_family_ready()
+    chores = chores_rows(family_id)
+
+    page = """
+    <h1>Edit Chores</h1>
+
+    <div class="card">
+      <h2>Add / Update</h2>
+      <form method="post" action="{{ url_for('parent_save_chore') }}">
+        <div class="row">
+          <input name="chore_key" placeholder="id (example: vacuum)" required />
+          <input name="title" placeholder="title kids see" required />
+          <input name="reward_cents" placeholder="cents (example: 75)" required />
+          <select name="requires_approval">
+            <option value="1">Needs approval</option>
+            <option value="0">Auto-approved</option>
+          </select>
+          <button class="btn btn-primary" type="submit">Save</button>
+        </div>
+      </form>
+      <p><small>100 cents = $1.00</small></p>
+    </div>
+
+    <div class="card">
+      <h2>Current chores</h2>
+      {% if chores|length == 0 %}
+        <p>No chores.</p>
+      {% else %}
+        <table>
+          <tr><th>ID</th><th>Title</th><th>Payout</th><th>Approval</th><th>Delete</th></tr>
+          {% for c in chores %}
+            <tr>
+              <td>{{ c['chore_key'] }}</td>
+              <td>{{ c['title'] }}</td>
+              <td>{{ dollars(c['reward_cents']) }}</td>
+              <td>{% if c['requires_approval'] %}needs approval{% else %}auto{% endif %}</td>
+              <td>
+                <form method="post" action="{{ url_for('parent_delete_chore') }}">
+                  <input type="hidden" name="chore_key" value="{{ c['chore_key'] }}" />
+                  <button class="btn btn-danger" type="submit">Delete</button>
+                </form>
+              </td>
+            </tr>
+          {% endfor %}
+        </table>
+      {% endif %}
+    </div>
+
+    <div class="card">
+      <a class="btn" href="{{ url_for('parent_dashboard') }}">Back to Parent</a>
+    </div>
+    """
+    body = render_template_string(page, chores=chores, dollars=dollars)
+    return render_template_string(BASE, title="Edit Chores", body=body)
+
+@app.post("/parent/chores/save")
+def parent_save_chore():
+    require_parent()
+    family_id = ensure_family_ready()
+
+    key = (request.form.get("chore_key") or "").strip()
+    title = (request.form.get("title") or "").strip()
+    raw = (request.form.get("reward_cents") or "0").strip()
+    requires = (request.form.get("requires_approval") or "1") == "1"
+    try:
+        cents = int(raw)
+    except ValueError:
+        cents = 0
+    if cents < 0:
+        cents = 0
+
+    add_or_update_chore_db(family_id, key, title, cents, requires)
+    return redirect(url_for("parent_edit_chores"))
+
+@app.post("/parent/chores/delete")
+def parent_delete_chore():
+    require_parent()
+    family_id = ensure_family_ready()
+    key = (request.form.get("chore_key") or "").strip()
+    delete_chore_db(family_id, key)
+    return redirect(url_for("parent_edit_chores"))
 
 
 # ============================================================
-# ENTRY
+# STARTUP
 # ============================================================
+
+# Create tables on import (safe)
+if DATABASE_OK:
+    init_db()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
