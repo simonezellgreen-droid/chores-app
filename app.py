@@ -1,19 +1,10 @@
 from __future__ import annotations
-
 import os, json, time
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Dict, List
 from functools import wraps
-
-from flask import (
-    Flask, request, redirect, url_for,
-    render_template_string, session
-)
-
-# ============================================================
-# App + Security
-# ============================================================
+from typing import Dict, List
+from flask import Flask, request, redirect, url_for, render_template_string, session
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret")
@@ -22,8 +13,10 @@ FAMILY_CODE = os.environ.get("FAMILY_CODE", "1234")
 DATA_FILE = "chores_game.json"
 
 
-def dollars(cents: int) -> str:
-    return f"${cents/100:.2f}"
+# -------------------- Utilities --------------------
+
+def dollars(c):
+    return f"${c/100:.2f}"
 
 
 def require_family(view):
@@ -37,85 +30,52 @@ def require_family(view):
                 session["family_ok"] = True
                 return redirect(request.path)
 
-        return render_template_string(
-            BASE,
-            title="Family Code",
-            body="""
-            <h1>Family Code</h1>
-            <div class="card">
-              <form method="post">
-                <input name="code" placeholder="Family code" required />
-                <button class="btn btn-primary">Enter</button>
-              </form>
-            </div>
-            """
-        )
+        return render_template_string(TEMPLATE, page="code")
+
     return wrapped
 
 
-# ============================================================
-# Data Models
-# ============================================================
+# -------------------- Models --------------------
 
 @dataclass
 class Kid:
     name: str
-    goal_cents: int = 0
+    goal: int = 0
 
 
 @dataclass
 class Chore:
     id: str
     title: str
-    reward_cents: int
-    requires_approval: bool = True
+    reward: int
+    approval: bool = True
 
 
 @dataclass
-class LedgerEntry:
+class Entry:
     kid: str
     chore: str
-    reward_cents: int
+    reward: int
     ts: float
-    status: str  # pending | approved | denied | paid
+    status: str
 
 
-# ============================================================
-# Storage
-# ============================================================
+# -------------------- Storage --------------------
 
-class Store:
-    def __init__(self):
-        self.path = Path(DATA_FILE)
-
-    def load(self):
-        if not self.path.exists():
-            return {"kids": {}, "chores": {}, "ledger": []}
-        return json.loads(self.path.read_text())
-
-    def save(self, data):
-        self.path.write_text(json.dumps(data, indent=2))
+def load():
+    if not Path(DATA_FILE).exists():
+        return {"kids": {}, "chores": {}, "ledger": []}
+    return json.loads(Path(DATA_FILE).read_text())
 
 
-store = Store()
-data = store.load()
+def save(data):
+    Path(DATA_FILE).write_text(json.dumps(data, indent=2))
 
 
-# ============================================================
-# Game Logic
-# ============================================================
-
-kids: Dict[str, Kid] = {
-    k: Kid(**v) for k, v in data["kids"].items()
-}
-
-chores: Dict[str, Chore] = {
-    c: Chore(**v) for c, v in data["chores"].items()
-}
-
-ledger: List[LedgerEntry] = [
-    LedgerEntry(**e) for e in data["ledger"]
-]
+data = load()
+kids: Dict[str, Kid] = {k: Kid(**v) for k, v in data["kids"].items()}
+chores: Dict[str, Chore] = {c: Chore(**v) for c, v in data["chores"].items()}
+ledger: List[Entry] = [Entry(**e) for e in data["ledger"]]
 
 if not chores:
     chores["bed"] = Chore("bed", "Make bed", 50, False)
@@ -123,108 +83,152 @@ if not chores:
 
 
 def save_all():
-    store.save({
+    save({
         "kids": {k: asdict(v) for k, v in kids.items()},
         "chores": {k: asdict(v) for k, v in chores.items()},
         "ledger": [asdict(e) for e in ledger]
     })
 
 
-# ============================================================
-# UI Base
-# ============================================================
+# -------------------- Template --------------------
 
-BASE = """
+TEMPLATE = """
 <!doctype html>
-<title>{{title}}</title>
+<title>Chores</title>
 <style>
 body { font-family: Arial; max-width: 900px; margin: 20px auto; }
-.card { border: 1px solid #ddd; padding: 14px; margin: 14px 0; border-radius: 12px; }
-.btn { padding: 8px 12px; border-radius: 10px; border: 1px solid #aaa; background: #eee; }
-.btn-primary { background: black; color: white; }
+.card { border: 1px solid #ccc; padding: 12px; margin: 12px 0; border-radius: 10px; }
+button { padding: 6px 10px; }
 table { width: 100%; border-collapse: collapse; }
 td, th { padding: 6px; border-bottom: 1px solid #eee; }
+nav a { margin-right: 10px; }
 </style>
 
 <nav>
-<a href="/">Home</a> |
-<a href="/kid">Kid</a> |
-<a href="/parent">Parent</a> |
+<a href="/">Home</a>
+<a href="/kid">Kid</a>
+<a href="/parent">Parent</a>
 <a href="/logout">Logout</a>
 </nav>
 <hr>
 
-{{ body|safe }}
+{% if page == "code" %}
+<h2>Enter Family Code</h2>
+<form method="post">
+  <input name="code" required>
+  <button>Enter</button>
+</form>
+
+{% elif page == "home" %}
+<h1>Main Menu</h1>
+
+{% elif page == "kid" %}
+<h1>Kid Menu</h1>
+<form method="post" action="/kid/log">
+<select name="kid">
+{% for k in kids %}
+<option>{{k}}</option>
+{% endfor %}
+</select>
+
+<select name="chore">
+{% for c in chores %}
+<option value="{{c.id}}">
+{{c.title}} ({{ dollars(c.reward) }})
+</option>
+{% endfor %}
+</select>
+<button>Log</button>
+</form>
+
+<h3>View Summary</h3>
+<form method="get" action="/kid/summary">
+<select name="kid">
+{% for k in kids %}
+<option>{{k}}</option>
+{% endfor %}
+</select>
+<button>View</button>
+</form>
+
+{% elif page == "kid_summary" %}
+<h2>{{kid}} Summary</h2>
+<p>Approved: {{ dollars(approved) }}</p>
+<p>Paid: {{ dollars(paid) }}</p>
+<p>Streak: {{streak}} chores</p>
+
+<ul>
+{% for e in entries %}
+<li>{{e.chore}} - {{e.status}}</li>
+{% endfor %}
+</ul>
+
+{% elif page == "parent" %}
+<h1>Parent Dashboard</h1>
+
+<table>
+<tr><th>Kid</th><th>Owed</th><th>Details</th><th>Pay</th></tr>
+{% for k in kids %}
+<tr>
+<td>{{k}}</td>
+<td>{{ dollars(owed[k]) }}</td>
+<td>
+<ul>
+{% for e in ledger if e.kid==k and e.status=="approved" %}
+<li>{{e.chore}} ({{dollars(e.reward)}})</li>
+{% endfor %}
+</ul>
+</td>
+<td>
+<form method="post" action="/parent/pay">
+<input type="hidden" name="kid" value="{{k}}">
+<button>Pay</button>
+</form>
+</td>
+</tr>
+{% endfor %}
+</table>
+
+<h3>Pending</h3>
+{% for e in ledger if e.status=="pending" %}
+<div class="card">
+{{e.kid}} - {{e.chore}}
+<form method="post" action="/parent/approve">
+<input type="hidden" name="index" value="{{loop.index0}}">
+<button name="action" value="approve">Approve</button>
+<button name="action" value="deny">Deny</button>
+</form>
+</div>
+{% endfor %}
+
+{% endif %}
 """
 
 
-# ============================================================
-# Routes
-# ============================================================
+# -------------------- Routes --------------------
 
-@app.route("/", methods=["GET", "POST"])
+@app.route("/", methods=["GET","POST"])
 @require_family
 def home():
-    return render_template_string(
-        BASE,
-        title="Home",
-        body="""
-        <h1>Chores App</h1>
-        <div class="card">
-          <a class="btn btn-primary" href="/kid">Kid Menu</a>
-          <a class="btn btn-primary" href="/parent">Parent Menu</a>
-        </div>
-        """
-    )
+    return render_template_string(TEMPLATE, page="home")
 
 
 @app.get("/kid")
 @require_family
-def kid_menu():
-    return render_template_string(
-        BASE,
-        title="Kid",
-        body="""
-        <h1>Kid Menu</h1>
-        <div class="card">
-          <form method="post" action="/kid/log">
-            <select name="kid">
-              {% for k in kids %}<option>{{k}}</option>{% endfor %}
-            </select>
-            <select name="chore">
-              {% for c in chores.values() %}
-                <option value="{{c.id}}">
-                  {{c.title}} ({{ dollars(c.reward_cents) }})
-                </option>
-              {% endfor %}
-            </select>
-            <button class="btn btn-primary">Log Chore</button>
-          </form>
-        </div>
-
-        <div class="card">
-          <h2>Kid Summary</h2>
-          <form method="get" action="/kid/summary">
-            <select name="kid">
-              {% for k in kids %}<option>{{k}}</option>{% endfor %}
-            </select>
-            <button class="btn">View</button>
-          </form>
-        </div>
-        """,
-        kids=kids.keys(),
-        chores=chores,
-        dollars=dollars
-    )
+def kid():
+    return render_template_string(TEMPLATE, page="kid",
+                                  kids=kids.keys(),
+                                  chores=chores.values(),
+                                  dollars=dollars)
 
 
 @app.post("/kid/log")
 @require_family
 def kid_log():
-    kid = request.form["kid"]
-    chore = chores[request.form["chore"]]
-    status = "pending" if chore.requires_approval else "approved"
-    ledger.append(LedgerEntry(kid, chore.title, chore.reward_cents, time.time(), status))
+    k = request.form["kid"]
+    c = chores[request.form["chore"]]
+    status = "pending" if c.approval else "approved"
+    ledger.append(Entry(k, c.title, c.reward, time.time(), status))
     save_all()
     return redirect("/kid")
 
@@ -233,30 +237,14 @@ def kid_log():
 @require_family
 def kid_summary():
     kid = request.args["kid"]
-    entries = [e for e in ledger if e.kid == kid]
-    approved = sum(e.reward_cents for e in entries if e.status == "approved")
-    paid = sum(e.reward_cents for e in entries if e.status == "paid")
-
-    return render_template_string(
-        BASE,
-        title="Kid Summary",
-        body="""
-        <h1>{{kid}}'s Summary</h1>
-        <p>Approved: {{ dollars(approved) }}</p>
-        <p>Paid: {{ dollars(paid) }}</p>
-
-        <ul>
-        {% for e in entries %}
-          <li>{{ e.chore }} – {{ e.status }}</li>
-        {% endfor %}
-        </ul>
-        """,
-        kid=kid,
-        entries=entries,
-        approved=approved,
-        paid=paid,
-        dollars=dollars
-    )
+    entries = [e for e in ledger if e.kid==kid]
+    approved = sum(e.reward for e in entries if e.status=="approved")
+    paid = sum(e.reward for e in entries if e.status=="paid")
+    streak = len([e for e in entries if e.status!="denied"])
+    return render_template_string(TEMPLATE, page="kid_summary",
+                                  kid=kid, entries=entries,
+                                  approved=approved, paid=paid,
+                                  streak=streak, dollars=dollars)
 
 
 @app.get("/parent")
@@ -264,44 +252,35 @@ def kid_summary():
 def parent():
     owed = {}
     for k in kids:
-        owed[k] = sum(
-            e.reward_cents for e in ledger
-            if e.kid == k and e.status == "approved"
-        )
+        owed[k] = sum(e.reward for e in ledger if e.kid==k and e.status=="approved")
+    return render_template_string(TEMPLATE,
+                                  page="parent",
+                                  kids=kids.keys(),
+                                  ledger=ledger,
+                                  owed=owed,
+                                  dollars=dollars)
 
-    return render_template_string(
-        BASE,
-        title="Parent",
-        body="""
-        <h1>Parent Dashboard</h1>
-        <table>
-          <tr><th>Kid</th><th>Owed</th><th>Pay</th></tr>
-          {% for k, amt in owed.items() %}
-            <tr>
-              <td>{{k}}</td>
-              <td>{{ dollars(amt) }}</td>
-              <td>
-                <form method="post" action="/parent/pay">
-                  <input type="hidden" name="kid" value="{{k}}">
-                  <button class="btn">Mark Paid</button>
-                </form>
-              </td>
-            </tr>
-          {% endfor %}
-        </table>
-        """,
-        owed=owed,
-        dollars=dollars
-    )
+
+@app.post("/parent/approve")
+@require_family
+def approve():
+    index = int(request.form["index"])
+    action = request.form["action"]
+    if action=="approve":
+        ledger[index].status="approved"
+    else:
+        ledger[index].status="denied"
+    save_all()
+    return redirect("/parent")
 
 
 @app.post("/parent/pay")
 @require_family
-def parent_pay():
+def pay():
     kid = request.form["kid"]
     for e in ledger:
-        if e.kid == kid and e.status == "approved":
-            e.status = "paid"
+        if e.kid==kid and e.status=="approved":
+            e.status="paid"
     save_all()
     return redirect("/parent")
 
@@ -310,3 +289,8 @@ def parent_pay():
 def logout():
     session.clear()
     return redirect("/")
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port)
