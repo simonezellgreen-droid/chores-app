@@ -1,296 +1,334 @@
-from __future__ import annotations
-import os, json, time
-from dataclasses import dataclass, asdict
-from pathlib import Path
-from functools import wraps
-from typing import Dict, List
-from flask import Flask, request, redirect, url_for, render_template_string, session
+from flask import Flask, request, redirect, session, render_template_string
+import os
+import json
+import time
+from datetime import datetime, date
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "dev-secret")
+app.secret_key = "super_secret_key_change_me"
 
-FAMILY_CODE = os.environ.get("FAMILY_CODE", "1234")
-DATA_FILE = "chores_game.json"
-
-
-# -------------------- Utilities --------------------
-
-def dollars(c):
-    return f"${c/100:.2f}"
+DATA_FILE = "data.json"
+FAMILY_CODE = "FAMILY123"  # change this
 
 
-def require_family(view):
-    @wraps(view)
-    def wrapped(*args, **kwargs):
-        if session.get("family_ok"):
-            return view(*args, **kwargs)
+# --------------------------
+# Data Helpers
+# --------------------------
 
-        if request.method == "POST":
-            if request.form.get("code") == FAMILY_CODE:
-                session["family_ok"] = True
-                return redirect(request.path)
-
-        return render_template_string(TEMPLATE, page="code")
-
-    return wrapped
-
-
-# -------------------- Models --------------------
-
-@dataclass
-class Kid:
-    name: str
-    goal: int = 0
+def load_data():
+    if not os.path.exists(DATA_FILE):
+        return {
+            "kids": {},
+            "chores": {
+                "make_bed": {"title": "Make Bed", "reward": 50, "approval": False},
+                "dishes": {"title": "Dishes", "reward": 100, "approval": True}
+            },
+            "ledger": [],
+            "goals": {}
+        }
+    return json.load(open(DATA_FILE))
 
 
-@dataclass
-class Chore:
-    id: str
-    title: str
-    reward: int
-    approval: bool = True
+def save_data(data):
+    json.dump(data, open(DATA_FILE, "w"), indent=2)
 
 
-@dataclass
-class Entry:
-    kid: str
-    chore: str
-    reward: int
-    ts: float
-    status: str
+def dollars(cents):
+    return f"${cents/100:.2f}"
 
 
-# -------------------- Storage --------------------
-
-def load():
-    if not Path(DATA_FILE).exists():
-        return {"kids": {}, "chores": {}, "ledger": []}
-    return json.loads(Path(DATA_FILE).read_text())
+data = load_data()
 
 
-def save(data):
-    Path(DATA_FILE).write_text(json.dumps(data, indent=2))
+# --------------------------
+# Family Login
+# --------------------------
 
-
-data = load()
-kids: Dict[str, Kid] = {k: Kid(**v) for k, v in data["kids"].items()}
-chores: Dict[str, Chore] = {c: Chore(**v) for c, v in data["chores"].items()}
-ledger: List[Entry] = [Entry(**e) for e in data["ledger"]]
-
-if not chores:
-    chores["bed"] = Chore("bed", "Make bed", 50, False)
-    chores["dishes"] = Chore("dishes", "Unload dishwasher", 100, True)
-
-
-def save_all():
-    save({
-        "kids": {k: asdict(v) for k, v in kids.items()},
-        "chores": {k: asdict(v) for k, v in chores.items()},
-        "ledger": [asdict(e) for e in ledger]
-    })
-
-
-# -------------------- Template --------------------
-
-TEMPLATE = """
-<!doctype html>
-<title>Chores</title>
-<style>
-body { font-family: Arial; max-width: 900px; margin: 20px auto; }
-.card { border: 1px solid #ccc; padding: 12px; margin: 12px 0; border-radius: 10px; }
-button { padding: 6px 10px; }
-table { width: 100%; border-collapse: collapse; }
-td, th { padding: 6px; border-bottom: 1px solid #eee; }
-nav a { margin-right: 10px; }
-</style>
-
-<nav>
-<a href="/">Home</a>
-<a href="/kid">Kid</a>
-<a href="/parent">Parent</a>
-<a href="/logout">Logout</a>
-</nav>
-<hr>
-
-{% if page == "code" %}
-<h2>Enter Family Code</h2>
-<form method="post">
-  <input name="code" required>
-  <button>Enter</button>
-</form>
-
-{% elif page == "home" %}
-<h1>Main Menu</h1>
-
-{% elif page == "kid" %}
-<h1>Kid Menu</h1>
-<form method="post" action="/kid/log">
-<select name="kid">
-{% for k in kids %}
-<option>{{k}}</option>
-{% endfor %}
-</select>
-
-<select name="chore">
-{% for c in chores %}
-<option value="{{c.id}}">
-{{c.title}} ({{ dollars(c.reward) }})
-</option>
-{% endfor %}
-</select>
-<button>Log</button>
-</form>
-
-<h3>View Summary</h3>
-<form method="get" action="/kid/summary">
-<select name="kid">
-{% for k in kids %}
-<option>{{k}}</option>
-{% endfor %}
-</select>
-<button>View</button>
-</form>
-
-{% elif page == "kid_summary" %}
-<h2>{{kid}} Summary</h2>
-<p>Approved: {{ dollars(approved) }}</p>
-<p>Paid: {{ dollars(paid) }}</p>
-<p>Streak: {{streak}} chores</p>
-
-<ul>
-{% for e in entries %}
-<li>{{e.chore}} - {{e.status}}</li>
-{% endfor %}
-</ul>
-
-{% elif page == "parent" %}
-<h1>Parent Dashboard</h1>
-
-<table>
-<tr><th>Kid</th><th>Owed</th><th>Details</th><th>Pay</th></tr>
-{% for k in kids %}
-<tr>
-<td>{{k}}</td>
-<td>{{ dollars(owed[k]) }}</td>
-<td>
-<ul>
-{% for e in ledger if e.kid==k and e.status=="approved" %}
-<li>{{e.chore}} ({{dollars(e.reward)}})</li>
-{% endfor %}
-</ul>
-</td>
-<td>
-<form method="post" action="/parent/pay">
-<input type="hidden" name="kid" value="{{k}}">
-<button>Pay</button>
-</form>
-</td>
-</tr>
-{% endfor %}
-</table>
-
-<h3>Pending</h3>
-{% for e in ledger if e.status=="pending" %}
-<div class="card">
-{{e.kid}} - {{e.chore}}
-<form method="post" action="/parent/approve">
-<input type="hidden" name="index" value="{{loop.index0}}">
-<button name="action" value="approve">Approve</button>
-<button name="action" value="deny">Deny</button>
-</form>
-</div>
-{% endfor %}
-
-{% endif %}
-"""
-
-
-# -------------------- Routes --------------------
-
-@app.route("/", methods=["GET","POST"])
-@require_family
+@app.route("/", methods=["GET", "POST"])
 def home():
-    return render_template_string(TEMPLATE, page="home")
+    if request.method == "POST":
+        if request.form["code"] == FAMILY_CODE:
+            session["family"] = True
+            return redirect("/menu")
+    return """
+    <h1>Family Login</h1>
+    <form method="post">
+        <input name="code" placeholder="Enter family code">
+        <button>Enter</button>
+    </form>
+    """
 
 
-@app.get("/kid")
-@require_family
-def kid():
-    return render_template_string(TEMPLATE, page="kid",
-                                  kids=kids.keys(),
-                                  chores=chores.values(),
-                                  dollars=dollars)
+def require_login():
+    if not session.get("family"):
+        return redirect("/")
+    return None
 
 
-@app.post("/kid/log")
-@require_family
-def kid_log():
-    k = request.form["kid"]
-    c = chores[request.form["chore"]]
-    status = "pending" if c.approval else "approved"
-    ledger.append(Entry(k, c.title, c.reward, time.time(), status))
-    save_all()
-    return redirect("/kid")
+# --------------------------
+# Main Menu
+# --------------------------
+
+@app.route("/menu")
+def menu():
+    if require_login(): return require_login()
+    return """
+    <h1>Main Menu</h1>
+    <a href='/kid'>Kid Menu</a><br>
+    <a href='/parent'>Parent Dashboard</a><br>
+    <a href='/logout'>Logout</a>
+    """
 
 
-@app.get("/kid/summary")
-@require_family
-def kid_summary():
-    kid = request.args["kid"]
-    entries = [e for e in ledger if e.kid==kid]
-    approved = sum(e.reward for e in entries if e.status=="approved")
-    paid = sum(e.reward for e in entries if e.status=="paid")
-    streak = len([e for e in entries if e.status!="denied"])
-    return render_template_string(TEMPLATE, page="kid_summary",
-                                  kid=kid, entries=entries,
-                                  approved=approved, paid=paid,
-                                  streak=streak, dollars=dollars)
-
-
-@app.get("/parent")
-@require_family
-def parent():
-    owed = {}
-    for k in kids:
-        owed[k] = sum(e.reward for e in ledger if e.kid==k and e.status=="approved")
-    return render_template_string(TEMPLATE,
-                                  page="parent",
-                                  kids=kids.keys(),
-                                  ledger=ledger,
-                                  owed=owed,
-                                  dollars=dollars)
-
-
-@app.post("/parent/approve")
-@require_family
-def approve():
-    index = int(request.form["index"])
-    action = request.form["action"]
-    if action=="approve":
-        ledger[index].status="approved"
-    else:
-        ledger[index].status="denied"
-    save_all()
-    return redirect("/parent")
-
-
-@app.post("/parent/pay")
-@require_family
-def pay():
-    kid = request.form["kid"]
-    for e in ledger:
-        if e.kid==kid and e.status=="approved":
-            e.status="paid"
-    save_all()
-    return redirect("/parent")
-
-
-@app.get("/logout")
+@app.route("/logout")
 def logout():
     session.clear()
     return redirect("/")
 
 
+# --------------------------
+# Kid Menu
+# --------------------------
+
+@app.route("/kid")
+def kid():
+    if require_login(): return require_login()
+
+    kids = data["kids"]
+    chores = data["chores"]
+
+    template = """
+    <h1>Kid Menu</h1>
+
+    <form method="post" action="/log">
+        <select name="kid">
+            {% for k in kids %}
+                <option>{{k}}</option>
+            {% endfor %}
+        </select>
+
+        <select name="chore">
+            {% for id, c in chores.items() %}
+                <option value="{{id}}">
+                    {{c.title}} ({{dollars(c.reward)}})
+                </option>
+            {% endfor %}
+        </select>
+
+        <button>Log Chore</button>
+    </form>
+
+    <h2>Kid Summary</h2>
+    <form method="get" action="/kid_summary">
+        <select name="kid">
+            {% for k in kids %}
+                <option>{{k}}</option>
+            {% endfor %}
+        </select>
+        <button>View</button>
+    </form>
+
+    <a href='/menu'>Back</a>
+    """
+
+    return render_template_string(template, kids=kids, chores=chores, dollars=dollars)
+
+
+@app.route("/log", methods=["POST"])
+def log():
+    kid = request.form["kid"]
+    chore_id = request.form["chore"]
+
+    chore = data["chores"][chore_id]
+
+    entry = {
+        "kid": kid,
+        "chore": chore["title"],
+        "reward": chore["reward"],
+        "approval": chore["approval"],
+        "status": "pending" if chore["approval"] else "approved",
+        "date": str(date.today())
+    }
+
+    data["ledger"].append(entry)
+    save_data(data)
+    return redirect("/kid")
+
+
+# --------------------------
+# Kid Summary
+# --------------------------
+
+@app.route("/kid_summary")
+def kid_summary():
+    kid = request.args["kid"]
+
+    entries = [e for e in data["ledger"] if e["kid"] == kid]
+    total = sum(e["reward"] for e in entries if e["status"] == "approved")
+
+    streak = calculate_streak(kid)
+
+    template = """
+    <h1>{{kid}} Summary</h1>
+
+    <p>Total Approved Money: {{dollars(total)}}</p>
+    <p>Current Streak: {{streak}} days</p>
+
+    <h3>Chores Done</h3>
+    <ul>
+    {% for e in entries %}
+        <li>{{e.chore}} - {{e.status}}</li>
+    {% endfor %}
+    </ul>
+
+    <a href='/kid'>Back</a>
+    """
+
+    return render_template_string(template, kid=kid, entries=entries,
+                                  total=total, dollars=dollars, streak=streak)
+
+
+def calculate_streak(kid):
+    dates = sorted({e["date"] for e in data["ledger"] if e["kid"] == kid})
+    if not dates: return 0
+
+    streak = 0
+    today = date.today()
+
+    for i in range(len(dates)):
+        check = today.replace(day=today.day - i)
+        if str(check) in dates:
+            streak += 1
+        else:
+            break
+    return streak
+
+
+# --------------------------
+# Parent Dashboard
+# --------------------------
+
+@app.route("/parent")
+def parent():
+    if require_login(): return require_login()
+
+    owed = {}
+    for kid in data["kids"]:
+        owed[kid] = sum(
+            e["reward"] for e in data["ledger"]
+            if e["kid"] == kid and e["status"] == "approved"
+        )
+
+    template = """
+    <h1>Parent Dashboard</h1>
+
+    <h2>Money Owed</h2>
+    <ul>
+    {% for kid, amount in owed.items() %}
+        <li>{{kid}} - {{dollars(amount)}}
+            <form method="post" action="/pay" style="display:inline;">
+                <input type="hidden" name="kid" value="{{kid}}">
+                <button>Mark Paid</button>
+            </form>
+        </li>
+    {% endfor %}
+    </ul>
+
+    <h2>Pending Approvals</h2>
+    <ul>
+    {% for i, e in enumerate(data["ledger"]) %}
+        {% if e.status == "pending" %}
+            <li>
+                {{e.kid}} - {{e.chore}}
+                <form method="post" action="/approve" style="display:inline;">
+                    <input type="hidden" name="i" value="{{i}}">
+                    <button name="action" value="approve">Approve</button>
+                    <button name="action" value="deny">Deny</button>
+                </form>
+            </li>
+        {% endif %}
+    {% endfor %}
+    </ul>
+
+    <a href='/edit_chores'>Edit Chores</a><br>
+    <a href='/menu'>Back</a>
+    """
+
+    return render_template_string(template, owed=owed, dollars=dollars,
+                                  data=data, enumerate=enumerate)
+
+
+@app.route("/approve", methods=["POST"])
+def approve():
+    i = int(request.form["i"])
+    action = request.form["action"]
+
+    if action == "approve":
+        data["ledger"][i]["status"] = "approved"
+    else:
+        data["ledger"][i]["status"] = "denied"
+
+    save_data(data)
+    return redirect("/parent")
+
+
+@app.route("/pay", methods=["POST"])
+def pay():
+    kid = request.form["kid"]
+
+    for e in data["ledger"]:
+        if e["kid"] == kid and e["status"] == "approved":
+            e["status"] = "paid"
+
+    save_data(data)
+    return redirect("/parent")
+
+
+# --------------------------
+# Edit Chores
+# --------------------------
+
+@app.route("/edit_chores", methods=["GET", "POST"])
+def edit_chores():
+    if require_login(): return require_login()
+
+    if request.method == "POST":
+        data["chores"][request.form["id"]] = {
+            "title": request.form["title"],
+            "reward": int(request.form["reward"]),
+            "approval": request.form.get("approval") == "on"
+        }
+        save_data(data)
+        return redirect("/edit_chores")
+
+    template = """
+    <h1>Edit Chores</h1>
+
+    <form method="post">
+        <input name="id" placeholder="id">
+        <input name="title" placeholder="title">
+        <input name="reward" placeholder="reward cents">
+        Needs approval <input type="checkbox" name="approval">
+        <button>Save</button>
+    </form>
+
+    <h2>Current Chores</h2>
+    <ul>
+    {% for id, c in data["chores"].items() %}
+        <li>{{c.title}} - {{dollars(c.reward)}}</li>
+    {% endfor %}
+    </ul>
+
+    <a href='/parent'>Back</a>
+    """
+
+    return render_template_string(template, data=data, dollars=dollars)
+
+
+# --------------------------
+# Run
+# --------------------------
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5000"))
+    port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
